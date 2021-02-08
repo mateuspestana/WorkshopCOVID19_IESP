@@ -1,0 +1,563 @@
+---
+title: "Workshop - Visualizando dados da COVID-19 no Brasil"
+output: 
+  html_notebook: 
+    highlight: pygments
+    theme: cosmo
+---
+
+```{r funcoes}
+tabela <- function(x, y = "350px") {
+  kable(x) %>% 
+  kable_styling() %>% 
+  kable_paper(full_width = FALSE) %>% 
+  scroll_box(height = y)
+}
+
+```
+
+
+# Introdução e objetivos
+
+O presente workshop tem como objetivo reforçar conhecimentos na utilização do R para a geração de relatórios, manipulação de bancos de dados, geração de gráficos dinâmicos, e enfrentamento de problemas de dados com dados reais. Ao fim do workshop, o participante terá gerado um relatório em `.html` usando a linguagem RMarkdown com todo o seu trabalho, incluindo visualizações dinâmicas e mapas. 
+
+O que está sendo aprendido aqui, na realidade, é como ter um fluxo de trabalho que envolve: 
+
+- importação de dados
+- compreensão de como os dados estão consolidados
+- planejamento do que precisamos 
+- adaptação dos dados ao planejado
+- geração de relatórios com todo esse fluxo de trabalho
+
+# Pacotes 
+
+Para iniciar, os seguinte pacote deverá ser instalado: 
+
+```{r}
+install.packages("pacman")
+```
+
+E os seguintes carregados:
+
+```{r}
+pacman::p_load(tidyverse, rio, leaflet, plotly, skimr, kableExtra, sidrar, hrbrthemes, magrittr, paletteer, plotly, leaflet, geobr, sf)
+```
+
+# Importando a base
+
+É preciso baixar o arquivo de dados do Ministério da saúde, no link https://covid.saude.gov.br/ > _Arquivo CSV_. Todavia, inseri a versão de 30/01/2021 no presente repositório, sob o nome de `covid.fst`. Importante: caso baixe o arquivo do MS, salve-o na mesma pasta dos arquivos do R. 
+
+Utilizaremos o pacote `rio` para importá-lo. 
+
+```{r}
+covidbr <- import("covid.fst") # Caso use o meu arquivo
+covidbr <- import("HIST_PAINEL_COVIDBR_30jan2021.csv") # Caso use o arquivo do MS (alterar a data!)
+```
+
+# Exploração inicial
+
+Com o banco importado, precisamos olhar para ele e entender como ele está consolidado. Existem 2 formas de fazer isso:
+
+1) A primeira forma é manual, buscando as dimensões, o nome das variáveis, o tipo de cada uma, o que pode ser resumido com os comandos:
+```{r}
+glimpse(covidbr)
+summary(covidbr)
+```
+
+2) A forma mais prática, que é pelo pacote `skimr`
+
+```{r}
+skim(covidbr)
+```
+
+Se olharmos para o _output_ do `skim()`, notamos o seguinte: 
+
+- ele separa as variáveis por tipos: categórico (4), data (1), numérico (12). 
+- no tipo categórico, temos `regiao`, `estado`, `municipio`, `nomeRegiaoSaude`. 
+- do tipo data, apenas a variável data.
+- do tipo numérico, as variáveis que começam com `cod*` provavelmente são um id, um código identificador. 
+- ainda no tipo numérico, temos __interior/metropolitana__, que provavelmente é uma variável *dummy*. Vamos explorar cada uma delas. 
+
+# Analisando as variáveis
+
+## Categóricas
+
+Retornando ao _output_ do `skim()`, temos o seguinte:
+
+- A variável `regiao` possui um n_unique de 6, ou seja, 6 valores únicos. Isso nos soa estranho, pois o Brasil só tem 5 regiões. Vamos analisar o que acontece na variável `regiao`:
+
+```{r}
+covidbr %>% 
+  count(regiao) %>% tabela()
+```
+
+Ou seja: há um problema no banco que pode vir a nos atrapalhar posteriormente, que é a inclusão dos dados agregados a nível de Brasil, misturado com o resto dos dados. Corrigiremos posteriormente.
+
+Já na variável estado, vemos 28 casos únicos, e o Brasil tem 26 estados e 1 DF. Suspeitamos que seja novamente a inserção de dados agregados, e vamos verificar:
+
+```{r}
+covidbr %>% 
+  count(estado) %>% tabela()
+```
+
+Temos um estado em branco com o mesmo número de casos que o Brasil, ou seja, são dados agregados com certeza. 
+
+Vamos verificar a variável município, mas ao invés de plotar todos os municípios, vamos contar quantos estão presentes no banco e depois, pegar só as primeiras entradas: 
+
+```{r}
+covidbr %>% 
+  count(municipio) %>% 
+  count() %>% tabela()
+
+covidbr %>% 
+  count(municipio) %>% 
+  head(5) %>% tabela()
+```
+
+Mais uma vez, confirmado: existem casos agregados a nível de Brasil (e possivelmente, região e estado) que atrapalham nosso banco. Se dermos um `head` no banco, notamos isso:
+
+```{r}
+head(covidbr) %>% tabela()
+```
+
+Além disso, essas variáveis (salvo município) precisam estar como fatores. Corrigiremos mais pra frente.
+
+## Data
+
+Analisando a variável de data:
+
+```{r}
+summary(covidbr$data)
+```
+
+Nada de errado com ela: o banco se inicia em 25-02-2020 e termina em 30-01-2021. 
+
+## Numéricas/Contínuas
+
+As duas variáveis que se iniciam com `cod` e a variável `interior/metropolitana` possivelmente devem ser convertidas para fatores. Vamos verificar se é o caso:
+
+```{r}
+covidbr %>% 
+    count(coduf) %>% tabela()
+
+covidbr %>% 
+  count(codmun) %>% 
+  head(20) %>% tabela()
+```
+
+Logo, o que precisamos fazer: remover todos os dados agregados e converter variáveis para o tipo fator. O ideal seria transpor os agregados para um banco diferente, o que também faremos, mas aprenderemos a agregar e sumarizar os dados do zero.
+
+# Criando o banco dos dados agregados e removendo do original
+
+Como podemos pegar os dados agregados? É possível perceber que os dados agregados podem ser capturados de muitas maneiras, e cada uma tem sua contrapartida. A melhor, nesse caso aqui, é filtrar pelos municípios com nome vazio (diferente de _NA_)
+
+```{r}
+covid_agg <- covidbr %>% 
+  filter(municipio == "")
+```
+
+E agora, usando a função `anti_join()` podemos remover esses casos do banco original:
+
+```{r}
+covidbr <- covidbr %>% 
+  anti_join(covid_agg)
+```
+
+# Alterando as variáveis
+
+Agora, vamos fazer as correções no que tange ao formato/tipo das variáveis que queremos mudar. Poderíamos usar o comando `mutate()` e ir alterando uma a uma. Porém, nosso problema é mais simples: temos muitas variáveis e todas elas receberão a mesma função: a conversão para fator (`as.factor()`). Logo, existe um sub-verbo do tidyverse que é o `mutate_at()`, que serve justamente para isso: aplicar uma mesma função em várias variáveis, de uma só vez. 
+
+```{r}
+covidbr <- covidbr %>% 
+  mutate_at(vars(regiao, estado, municipio, coduf, codmun, codRegiaoSaude, nomeRegiaoSaude,`interior/metropolitana`), as.factor) 
+```
+
+Vamos testar novamente o banco com um `summary()`:
+
+```{r}
+summary(covidbr)
+```
+
+O que temos agora é um banco em que cada linha é um município em uma data. O Brasil possui, segundo o IBGE, 5570 municípios, mas os dados abrangem somente 5297, faltando assim 273 municípios, sem dados. Isso é importante de relatar em qualquer estudo, e posteriormente veremos quais são esses municípios faltantes. 
+
+# Pequenas alterações 
+
+Seria interessante se tivéssemos não só número absoluto, mas também o relativo ao total da população. No banco, temos a variável `populacaoTCU2019`, que contém o dado populacional de 2019. Mais pra frente atualizaremos esse dado, mas por agora, vamos criar as variáveis `pct_obitos` e `pct_casos` de acordo com `populacaoTCU2019`:
+
+```{r}
+covidbr <- covidbr %>% 
+  mutate(pct_obitos = obitosAcumulado / populacaoTCU2019,
+         pct_casos = casosAcumulado / populacaoTCU2019)
+```
+
+# Perguntas rápidas? 
+
+- Quais os 5 municípios com maior número de casos recentemente? E de mortes?
+
+```{r}
+covidbr %>% 
+  filter(data == as.Date("2021-01-30")) %>% 
+  slice_max(casosAcumulado,n = 5) %>% 
+  select(estado, municipio, ends_with("Acumulado"), starts_with("pct_")) %>% tabela()
+
+covidbr %>% 
+  filter(data == as.Date("2021-01-30")) %>% 
+  slice_max(obitosAcumulado,n = 5) %>% 
+  select(estado, municipio, ends_with("Acumulado"), starts_with("pct_")) %>% tabela()
+
+```
+ 
+ O que percebemos acima? Brasília tem mais casos que o Rio, mas no Rio, morre-se mais. 
+ 
+
+- Quais os 5 municípios com menor número de casos recentemente? E de mortes?
+
+```{r}
+covidbr %>% 
+  filter(data == as.Date("2021-01-30")) %>% 
+  slice_min(casosAcumulado,n = 5) %>% 
+  select(estado, municipio, 
+         ends_with("Acumulado"), 
+         starts_with("pct_")) %>% 
+  arrange(casosAcumulado) %>% tabela()
+
+covidbr %>% 
+  filter(data == as.Date("2021-01-30")) %>% 
+  slice_min(obitosAcumulado,n = 5) %>% 
+  select(estado, municipio, 
+         ends_with("Acumulado"), 
+         starts_with("pct_")) %>% 
+  arrange(obitosAcumulado) %>% head(5) %>% tabela()
+
+```
+
+
+- Qual o estado com o maior número de casos recentemente? E de mortes?
+
+```{r}
+covidbr %>%
+  filter(data == max(data)) %>% 
+  group_by(estado) %>% 
+  summarise(total_casos = sum(casosAcumulado, na.rm = T),
+            total_obitos = sum(obitosAcumulado, na.rm = T)) %>% 
+  slice_max(total_casos, n = 1) %>% tabela(y = "100px")
+
+covidbr %>%
+  filter(data == max(data)) %>% 
+  group_by(estado) %>% 
+  summarise(total_casos = sum(casosAcumulado, na.rm = T),
+            total_obitos = sum(obitosAcumulado, na.rm = T)) %>% 
+  slice_max(total_obitos, n = 1) %>% tabela(y = "100px")
+```
+
+
+- Qual o estado com o menor número de casos recentemente? E de mortes?
+
+```{r}
+covidbr %>%
+  filter(data == max(data)) %>% 
+  group_by(estado) %>% 
+  summarise(total_casos = sum(casosAcumulado, na.rm = T),
+            total_obitos = sum(obitosAcumulado, na.rm = T)) %>% 
+  slice_min(total_casos, n = 1) %>% tabela(y = "100px")
+
+covidbr %>%
+  filter(data == max(data)) %>% 
+  group_by(estado) %>% 
+  summarise(total_casos = sum(casosAcumulado, na.rm = T),
+            total_obitos = sum(obitosAcumulado, na.rm = T)) %>% 
+  slice_min(total_obitos, n = 1) %>% tabela(y = "100px")
+```
+
+# Primeiras visualizações 
+
+A seguir, faremos as primeiras visualizações para entender esses gráficos, indo na base do que já fizemos com as estatísticas descritivas, mas aumentando cada vez mais o nível de complexidade.
+
+```{r}
+covidbr %>% 
+  group_by(data) %>% 
+  summarise(soma_casos = sum(casosAcumulado)) %>% 
+  ggplot(aes(x = as.Date(data), y = soma_casos))+
+  geom_area(fill = "lightsteelblue4", alpha = 0.8, color = "black")+
+  labs(title = "Curva de casos acumulados da COVID-19",
+       subtitle = "No Brasil",
+       x = "Mês",
+       y = "Nº de casos acumulados",
+       caption = "Fonte: O autor, 2021.")+
+  scale_y_continuous(breaks = seq(0, 9e6, 15e5))+
+  scale_x_date(date_breaks = "1 month", date_labels = "%b")+
+  theme_ipsum_tw()+
+  theme(plot.caption = element_text(hjust = 0))
+```
+
+
+```{r}
+covidbr %>% 
+  group_by(data, regiao) %>% 
+  summarise(soma_casos = sum(casosAcumulado)) %>% 
+  ggplot(aes(x = as.Date(data), y = soma_casos))+
+  geom_area(fill = "lightsteelblue4", alpha = 0.8, color = "black")+
+  labs(title = "Curva de casos acumulados da COVID-19",
+       subtitle = "No Brasil",
+       x = "Mês",
+       y = "Nº de casos acumulados",
+       caption = "Fonte: O autor, 2021.")+
+  scale_y_continuous(breaks = seq(0, 9e6, 15e5))+
+  scale_x_date(date_breaks = "2 month", date_labels = "%b")+
+  theme_ipsum_tw()+
+  theme(plot.caption = element_text(hjust = 0))+
+  facet_wrap(~regiao)
+```
+Ok, temos diferenças claras entre as regiões, mas as regiões tem um número muito variado na população. Vamos usar então a variável de `pct_casos` e `pct_obitos`. Mas antes disso, vamos recriá-las, com dados atualizados do IBGE. 
+
+## Atualizando dados populacionais
+
+
+Podemos baixar os dados da plataforma SIDRA do IBGE para obter esses dados. O R possui o pacote `sidraR` que permite o download fácil desse tipo de dado:
+
+```{r}
+municipios_ibge <- get_sidra(api = "/t/6579/n6/all/v/all") %>% 
+  janitor::clean_names()
+
+```
+6579 é a tabela com a população, e n6 é o nível de população em cada município. 
+
+O próximo passo é juntar ambos os bancos: a variável comum é o código do município.
+
+```{r}
+municipios_ibge <- municipios_ibge %>% 
+              select(municipio_codigo, valor) %>% 
+              mutate(codmun = as.factor(municipio_codigo)) %>% 
+              select(-municipio_codigo) 
+
+head(municipios_ibge) %>% tabela()
+
+```
+Todavia, temos um problema: o Ministério da Saúde usa um código de 6 dígitos para cada município, enquanto o IBGE usa 7 dígitos. Como o último dígito do IBGE é um dígito de controle, é mais fácil remover o do IBGE do que adicionar no banco do Ministério da Saúde. 
+
+```{r echo=TRUE}
+municipios_ibge %<>% 
+  mutate(codmun = gsub('.{1}$', '', codmun))
+```
+
+Agora podemos voltar a juntar os arquivos:
+
+```{r}
+covidbr %<>% 
+  left_join(municipios_ibge)
+```
+
+Será que não fizemos besteira e todos os municípios tem a sua população atualizada? 
+
+```{r}
+covidbr %>% 
+  filter(is.na(valor)) %>% 
+  nrow()
+```
+
+Sem casos NA, ou seja, todos os municípios foram assignados corretamente. 
+
+## Gráficos
+
+```{r}
+covidbr %>% 
+  group_by(data, regiao) %>% 
+  summarise(soma_casos = sum(casosAcumulado),
+            soma_pop = sum(valor)) %>% 
+  mutate(pct_casos = soma_casos / soma_pop) %>% 
+  ggplot(aes(x = as.Date(data), y = pct_casos))+
+  geom_area(fill = "lightsteelblue4", alpha = 0.8, color = "black")+
+  labs(title = "Curva de casos da COVID-19",
+       subtitle = "Em proporção da população",
+       x = "Mês",
+       y = "Nº de casos acumulados",
+       caption = "Fonte: O autor, 2021.")+
+  scale_y_percent(breaks = seq(0, 0.1, 0.02))+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b")+
+  theme_ipsum_tw()+
+  theme(plot.caption = element_text(hjust = 0))+
+  facet_wrap(~regiao)
+```
+
+Agora, para mortes:
+
+```{r}
+covidbr %>% 
+  group_by(data, regiao) %>% 
+  summarise(soma_casos = sum(obitosAcumulado),
+            soma_pop = sum(valor)) %>% 
+  mutate(pct_casos = soma_casos / soma_pop) %>% 
+  ggplot(aes(x = as.Date(data), y = pct_casos))+
+  geom_area(fill = "lightsteelblue4", alpha = 0.8, color = "black")+
+  labs(title = "Curva de óbitos da COVID-19",
+       subtitle = "Em proporção da população",
+       x = "Mês",
+       y = "Nº de casos acumulados",
+       caption = "Fonte: O autor, 2021.")+
+  scale_y_percent(n.breaks = 5, accuracy = 0.01)+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b")+
+  theme_ipsum_tw()+
+  theme(plot.caption = element_text(hjust = 0))+
+  facet_wrap(~regiao)
+```
+Agora, por estado. Essa visualização é um pouco densa e complexa de ser feita.
+
+```{r, fig.dim=c(10,7)}
+covidbr %>% 
+  group_by(data, regiao, estado) %>% 
+  summarise(soma_casos = sum(casosAcumulado),
+            soma_pop = sum(valor)) %>% 
+  mutate(pct_casos = soma_casos / soma_pop) %>% 
+  ggplot(aes(x = as.Date(data), y = pct_casos, fill = estado))+
+  geom_area(alpha = 0.8, color = "black")+
+  labs(title = "Curva de óbitos da COVID-19",
+       subtitle = "Em proporção da população",
+       x = "Mês",
+       y = "Nº de casos acumulados",
+       caption = "Fonte: O autor, 2021.")+
+  scale_y_percent(n.breaks = 5, accuracy = 0.01)+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b")+
+  theme_ipsum_tw()+
+  theme(plot.caption = element_text(hjust = 0),
+        legend.position = "right")+
+  scale_fill_paletteer_d("pals::polychrome")+
+  facet_wrap(~regiao)
+```
+```{r}
+covidbr %>% 
+  group_by(data, regiao, estado) %>% 
+  summarise(soma_casos = sum(obitosAcumulado),
+            soma_pop = sum(valor)) %>% 
+  mutate(pct_casos = soma_casos / soma_pop) %>% 
+  ggplot(aes(x = as.Date(data), y = pct_casos, fill = estado))+
+  geom_area(alpha = 0.8, color = "black")+
+  labs(title = "Curva de óbitos da COVID-19",
+       subtitle = "Em proporção da população",
+       x = "Mês",
+       y = "Nº de casos acumulados",
+       caption = "Fonte: O autor, 2021.")+
+  scale_y_percent(n.breaks = 5, accuracy = 0.01)+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b")+
+  theme_ipsum_tw()+
+  theme(plot.caption = element_text(hjust = 0),
+        legend.position = "right")+
+  scale_fill_paletteer_d("pals::polychrome")+
+  facet_wrap(~regiao)
+```
+
+## Gráficos dinâmicos
+
+```{r}
+covidbr %>% 
+  group_by(data, regiao, estado) %>% 
+  summarise(soma_casos = sum(casosAcumulado),
+            soma_pop = sum(valor)) %>% 
+  mutate(pct_casos = soma_casos / soma_pop) %>% 
+  ggplot(aes(x = as.Date(data), y = pct_casos, fill = estado))+
+  geom_area(alpha = 0.8, color = "black")+
+  labs(title = "Curva de óbitos da COVID-19",
+       subtitle = "Em proporção da população",
+       x = "Mês",
+       y = "Nº de casos acumulados",
+       caption = "Fonte: O autor, 2021.")+
+  scale_y_percent(n.breaks = 5, accuracy = 0.01)+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b")+
+  theme_ipsum_tw()+
+  theme(plot.caption = element_text(hjust = 0),
+        legend.position = "right")+
+  scale_fill_paletteer_d("pals::polychrome")+
+  facet_wrap(~regiao) -> covid_plotly1
+
+ggplotly(covid_plotly1)
+```
+
+```{r}
+covidbr %>% 
+  group_by(data, regiao, estado) %>% 
+  summarise(soma_casos = sum(obitosAcumulado),
+            soma_pop = sum(valor)) %>% 
+  mutate(pct_casos = soma_casos / soma_pop) %>% 
+  ggplot(aes(x = as.Date(data), y = pct_casos, fill = estado))+
+  geom_area(alpha = 0.8, color = "black")+
+  labs(title = "Curva de óbitos da COVID-19",
+       subtitle = "Em proporção da população",
+       x = "Mês",
+       y = "Nº de casos acumulados",
+       caption = "Fonte: O autor, 2021.")+
+  scale_y_percent(n.breaks = 5, accuracy = 0.01)+
+  scale_x_date(date_breaks = "2 months", date_labels = "%b")+
+  theme_ipsum_tw()+
+  theme(plot.caption = element_text(hjust = 0),
+        legend.position = "right")+
+  scale_fill_paletteer_d("pals::polychrome")+
+  facet_wrap(~regiao) -> covid_plotly2
+
+ggplotly(covid_plotly2)
+```
+
+## Mapas
+
+Por fim, vamos criar uma visualização do número total de casos na proporção da população. Para isso, usaremos os pacotes `geobr` e `leaflet`, além do próprio `ggplot`.
+
+Se quiséssemos um mapa estático, poderíamos usar o ggplot, já pronto para essa função. Para isso, precisamos dos vetores de mapa dos estados do Brasil. 
+
+```{r}
+map_br <- geobr::read_municipality(code_muni = "all") 
+map_est <- geobr::read_state("all")
+
+map_br %<>% 
+  mutate(codmun = gsub('.{1}$', '', code_muni))
+
+mapa_estados <- left_join(map_est, covidbr %>% 
+                            group_by(estado) %>% 
+                            summarise(soma_casos = sum(casosAcumulado),
+                                      soma_pop = sum(valor)) %>% 
+                            mutate(pct_casos = soma_casos/soma_pop), by = c("abbrev_state" = "estado"))
+mapa_estados %>% 
+  ggplot(aes(fill = pct_casos))+
+  geom_sf(color = "black")+
+  theme_ipsum_tw()+
+   scale_fill_gradientn(colors = viridis::inferno(27, direction = -1))+
+  labs(title = "A COVID-19 nos estados",
+       caption = "Fonte: O autor, 2021.")+
+    theme(plot.caption = element_text(hjust = 0))
+```
+
+Se quiséssemos um mapa dinâamico, clicável e manipulável em um HTML, usamos o `leaflet`. 
+
+```{r}
+
+mapa_muns <- left_join(map_br %>% 
+                           mutate(codmun = gsub('.{1}$', '', code_muni)), 
+                       covidbr %>% 
+                            group_by(codmun, municipio) %>% 
+                            summarise(soma_casos = sum(casosAcumulado),
+                                      soma_pop = sum(valor)) %>% 
+                            mutate(pct_casos = soma_casos/soma_pop), by = "codmun") %>% 
+  mutate(pct_casos_c = paste(format(100*pct_casos, digits = 1), "%"))
+
+pal <- colorBin("Oranges", domain = mapa_muns$pct_casos, bins = seq(0, 0.16,0.005), alpha = T)
+
+
+labels_casos <- sprintf("<strong>%s - %s</strong><br/> %s da população infectada", mapa_muns$name_muni, mapa_muns$abbrev_state, mapa_muns$pct_casos_c) %>%
+  lapply(htmltools::HTML)  
+
+leaflet() %>% 
+  # setView(lat = -22.0083, lng = -42.9675, zoom = 7.5) %>% 
+  addTiles() %>% 
+    addProviderTiles(providers$Esri.WorldImagery) %>% 
+  addPolygons(data = mapa_muns, 
+              label = labels_casos,
+              fillColor = ~pal(pct_casos),
+              fillOpacity = 1,
+              color = "black",
+              weight = 1.4,
+              labelOptions = labelOptions(style = list("font-weight" = "normal", padding = "3px 8px"),
+    textsize = "15px",
+    direction = "auto"))
+
+```
+
+> Fim
+
+Em caso de dúvidas, críticas ou sugestões, meu email é matheus.pestana@iesp.uerj.br
